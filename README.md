@@ -5,6 +5,9 @@ We are using https://github.com/hkmodd/ps2-recomp-Agent-SKILL  to do the heavy l
 
 WIP , Findings can be found below 
 
+<img width="640" height="448" alt="image" src="https://github.com/user-attachments/assets/5400ca07-d779-4dbf-b600-e464cc1195ea" />
+
+
 Session Log
 
 2026-09-07
