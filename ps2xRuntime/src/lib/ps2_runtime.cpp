@@ -37,6 +37,20 @@ namespace ps2_stubs
 #define EM_MIPS 8            // MIPS architecture
 #define PT_LOAD 1            // Loadable segment
 
+// Optional guest word incremented once per host frame (VSyncTimerHandler stand-in).
+uint32_t g_ps2GuestVsyncCounterAddr = 0;
+uint32_t g_ps2GuestVsyncCounterAddr2 = 0;
+// When set, sceGsSyncV returns the current field instead of parking the EE thread.
+uint32_t g_ps2SkipSceGsSyncVWait = 0;
+// pc=0 resume machinery (ATV1 pattern): when main thread goes Dormant at pc=0,
+// EeScheduler's usableResume() will resume it to the GS flip handler.
+uint32_t g_ps2Pc0ResumeRangeBegin = 0;
+uint32_t g_ps2Pc0ResumeRangeEnd = 0;
+uint32_t g_ps2Pc0ResumeTarget = 0;
+uint32_t g_ps2IdleResumePc = 0;
+uint32_t g_ps2IdleResumeA0 = 0;
+uint32_t g_ps2HoldEeTimeslices = 0;
+
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
@@ -90,7 +104,10 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // Real PS2 EE reserves the top 512KB of 32MB RDRAM for kernel stacks/pools; the user-heap
+    // ceiling is 0x01F80000 (= 32MB - 512KB). Title CRTs size their dlmalloc arena from this,
+    // so a lower hard limit makes their arena init produce a near-zero top chunk -> malloc fails.
+    constexpr uint32_t kGuestHeapHardLimit = 0x01F80000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -619,6 +636,9 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    // Temporary recomp diagnostic: retain the existing fixed-size GS event history so
+    // the black-frame trace can distinguish valid GIF parsing from DMA-only traffic.
+    m_gs.setDebugHistoryPaused(false);
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -2346,8 +2366,47 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    uint64_t hostFrames = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        ++hostFrames;
+        if (g_ps2GuestVsyncCounterAddr != 0u || g_ps2GuestVsyncCounterAddr2 != 0u)
+        {
+            uint8_t *const rdram = m_memory.getRDRAM();
+            const auto bumpGuestCounter = [&](uint32_t guestAddr)
+            {
+                if (guestAddr == 0u || rdram == nullptr)
+                {
+                    return;
+                }
+                const uint32_t phys = guestAddr & 0x1FFFFFFFu;
+                if (phys + 4u <= PS2_RAM_SIZE)
+                {
+                    uint32_t *counter = reinterpret_cast<uint32_t *>(rdram + phys);
+                    *counter += 1u;
+                }
+            };
+            bumpGuestCounter(g_ps2GuestVsyncCounterAddr);
+            bumpGuestCounter(g_ps2GuestVsyncCounterAddr2);
+            if ((hostFrames % 120 == 0) && rdram != nullptr)
+            {
+                uint32_t gameObj = *reinterpret_cast<uint32_t*>(rdram + (0x00404818u & 0x1FFFFFFFu));
+                if (gameObj != 0u && (gameObj & 0x1FFFFFFFu) + 0x300u <= PS2_RAM_SIZE)
+                {
+                    uint32_t feMgr = *reinterpret_cast<uint32_t*>(rdram + ((gameObj + 0x2B0u) & 0x1FFFFFFFu));
+                    if (feMgr != 0u && (feMgr & 0x1FFFFFFFu) + 0x100u <= PS2_RAM_SIZE)
+                    {
+                        uint32_t curState = *reinterpret_cast<uint32_t*>(rdram + ((feMgr + 0xCCu) & 0x1FFFFFFFu));
+                        uint32_t pendState = *reinterpret_cast<uint32_t*>(rdram + ((feMgr + 0xC8u) & 0x1FFFFFFFu));
+                        uint32_t parent = *reinterpret_cast<uint32_t*>(rdram + ((feMgr + 0x1Cu) & 0x1FFFFFFFu));
+                        std::cerr << "[ATV2:STATE] feMgr=0x" << std::hex << feMgr
+                                  << " curState=" << std::dec << curState
+                                  << " pendState=" << pendState
+                                  << " parent=0x" << std::hex << parent << std::dec << std::endl;
+                    }
+                }
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2379,6 +2438,119 @@ void PS2Runtime::run()
                                                << std::endl);
             }
         });
+        if ((hostFrames % 120u) == 0u)
+        {
+            const GSDebugSnapshot gsDiag = m_gs.getDebugSnapshot();
+            const std::vector<GSDebugHistoryEntry> gsHistory = m_gs.getDebugHistory();
+            uint64_t gifTagEvents = 0u;
+            uint64_t registerEvents = 0u;
+            uint64_t drawEvents = 0u;
+            uint64_t transferEvents = 0u;
+            uint64_t presentEvents = 0u;
+            GSDebugHistoryEntry latestDraw{};
+            bool hasLatestDraw = false;
+            for (const GSDebugHistoryEntry &event : gsHistory)
+            {
+                switch (event.kind)
+                {
+                case GSDebugEventKind::GifTag:
+                    ++gifTagEvents;
+                    break;
+                case GSDebugEventKind::Register:
+                    ++registerEvents;
+                    break;
+                case GSDebugEventKind::Draw:
+                    ++drawEvents;
+                    latestDraw = event;
+                    hasLatestDraw = true;
+                    break;
+                case GSDebugEventKind::Transfer:
+                    ++transferEvents;
+                    break;
+                case GSDebugEventKind::Present:
+                    ++presentEvents;
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            std::vector<uint8_t> presentationPixels;
+            uint32_t presentationWidth = 0u;
+            uint32_t presentationHeight = 0u;
+            const bool copiedPresentation = m_gs.copyLatchedHostPresentationFrame(
+                presentationPixels, presentationWidth, presentationHeight);
+            uint64_t nonBlackPixels = 0u;
+            uint64_t rgbSum = 0u;
+            for (size_t offset = 0u; offset + 3u < presentationPixels.size(); offset += 4u)
+            {
+                const uint32_t rgb = static_cast<uint32_t>(presentationPixels[offset]) |
+                                     static_cast<uint32_t>(presentationPixels[offset + 1u]) |
+                                     static_cast<uint32_t>(presentationPixels[offset + 2u]);
+                if (rgb != 0u)
+                    ++nonBlackPixels;
+                rgbSum += static_cast<uint64_t>(presentationPixels[offset]) +
+                          static_cast<uint64_t>(presentationPixels[offset + 1u]) +
+                          static_cast<uint64_t>(presentationPixels[offset + 2u]);
+            }
+
+            const GSRegisters &priv = m_memory.gs();
+            std::cerr << "[recomp:gs] hostFrame=" << hostFrames
+                      << " vsync=" << (m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u)
+                      << " dma=" << m_memory.dmaStartCount()
+                      << " gifCopies=" << m_memory.gifCopyCount()
+                      << " gsWrites=" << m_memory.gsWriteCount()
+                      << " vifWrites=" << m_memory.vifWriteCount()
+                      << " nativeGif=" << m_gs.nativePackedGIFPacketCount()
+                      << " nativeUploads=" << m_gs.nativeImageUploadCount()
+                      << " history=" << gsHistory.size()
+                      << " tags=" << gifTagEvents
+                      << " regs=" << registerEvents
+                      << " draws=" << drawEvents
+                      << " transfers=" << transferEvents
+                      << " presents=" << presentEvents
+                      << " pmode=0x" << std::hex << priv.pmode
+                      << " dispfb1=0x" << priv.dispfb1
+                      << " display1=0x" << priv.display1
+                      << " dispfb2=0x" << priv.dispfb2
+                      << " display2=0x" << priv.display2
+                      << std::dec
+                      << " ctx0=" << gsDiag.ctx[0].frame.fbp << "/" << gsDiag.ctx[0].frame.fbw
+                      << "/" << static_cast<unsigned int>(gsDiag.ctx[0].frame.psm)
+                      << " ctx1=" << gsDiag.ctx[1].frame.fbp << "/" << gsDiag.ctx[1].frame.fbw
+                      << "/" << static_cast<unsigned int>(gsDiag.ctx[1].frame.psm)
+                      << " hostPresent=" << (gsDiag.hasHostPresentationFrame ? 1u : 0u)
+                      << " " << gsDiag.hostPresentationWidth << "x" << gsDiag.hostPresentationHeight
+                      << " displayFbp=" << gsDiag.hostPresentationDisplayFbp
+                      << " sourceFbp=" << gsDiag.hostPresentationSourceFbp
+                      << " preferred=" << (gsDiag.hostPresentationUsedPreferred ? 1u : 0u)
+                      << " copied=" << (copiedPresentation ? 1u : 0u)
+                      << " pixels=" << (presentationPixels.size() / 4u)
+                      << " nonBlack=" << nonBlackPixels
+                      << " rgbSum=" << rgbSum
+                      << " trx=" << gsDiag.transferCopiedPixels << "/" << gsDiag.transferTotalPixels
+                      << " trxdir=" << gsDiag.trxdir
+                      << " sbp=" << gsDiag.bitbltbuf.sbp
+                      << " sbw=" << static_cast<unsigned int>(gsDiag.bitbltbuf.sbw)
+                      << " spsm=" << static_cast<unsigned int>(gsDiag.bitbltbuf.spsm)
+                      << " dbp=" << gsDiag.bitbltbuf.dbp
+                      << " dbw=" << static_cast<unsigned int>(gsDiag.bitbltbuf.dbw)
+                      << " dpsm=" << static_cast<unsigned int>(gsDiag.bitbltbuf.dpsm)
+                      << " src=" << gsDiag.trxpos.ssax << "," << gsDiag.trxpos.ssay
+                      << " dst=" << gsDiag.trxpos.dsax << "," << gsDiag.trxpos.dsay
+                      << " size=" << gsDiag.trxreg.rrw << "x" << gsDiag.trxreg.rrh
+                      << " lastDraw=" << (hasLatestDraw ? 1u : 0u)
+                      << ":prim" << static_cast<unsigned int>(latestDraw.prim.type)
+                      << ":tme" << (latestDraw.prim.tme ? 1u : 0u)
+                      << ":fbp" << latestDraw.frame.fbp
+                      << ":fbw" << latestDraw.frame.fbw
+                      << ":fpsm" << static_cast<unsigned int>(latestDraw.frame.psm)
+                      << ":tbp" << latestDraw.tex0.tbp0
+                      << ":tpsm" << static_cast<unsigned int>(latestDraw.tex0.psm)
+                      << ":cbp" << latestDraw.tex0.cbp
+                      << ":cpsm" << static_cast<unsigned int>(latestDraw.tex0.cpsm)
+                      << std::endl;
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2404,6 +2576,16 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        {
+            static uint64_t s_lastShotTick = 0;
+            const uint64_t vTick = m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0;
+            if (vTick >= 300 && (vTick - s_lastShotTick >= 300))
+            {
+                s_lastShotTick = vTick;
+                TakeScreenshot("C:/Users/Tyler/Projects/OFF ROAD FURY 2/recomp_screen.png");
+            }
+        }
 
         if (WindowShouldClose())
         {

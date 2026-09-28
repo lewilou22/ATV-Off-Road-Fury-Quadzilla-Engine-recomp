@@ -5,6 +5,8 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 
+extern uint32_t g_ps2SkipSceGsSyncVWait;
+
 namespace ps2_stubs
 {
     namespace
@@ -1280,6 +1282,16 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (::g_ps2SkipSceGsSyncVWait != 0u)
+        {
+            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            const int32_t field = g_gparam.interlace != 0u
+                                      ? static_cast<int32_t>((tick - 1u) & 1u)
+                                      : 1;
+            setReturnS32(ctx, field);
+            return;
+        }
+
         ps2_syscalls::WaitVSyncTick(rdram,
                                     ctx,
                                     runtime,

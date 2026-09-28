@@ -390,6 +390,7 @@ private:
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
+    void dumpIdleDiagnostics(const char *label = "IDLE DIAGNOSTICS");
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;
@@ -446,4 +447,8 @@ private:
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+    bool m_idleDiagDumped = false;
+    std::chrono::steady_clock::time_point m_lastDiagDumpTime{};
+    static constexpr int kDiagDumpIntervalMs = 2000;
+    uint32_t m_lastNonZeroPc = 0u;
 };

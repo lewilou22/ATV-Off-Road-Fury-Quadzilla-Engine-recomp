@@ -140,12 +140,12 @@ namespace
         return result;
     }
 
-    std::filesystem::path getExecutablePath(int argc, char *argv[])
+    std::filesystem::path getExecutablePath(const std::filesystem::path &argvBootPath)
     {
-        if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+        if (!argvBootPath.empty())
         {
             std::cout << "Using argv boot path" << std::endl;
-            return std::filesystem::path(argv[1]);
+            return argvBootPath;
         }
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
@@ -162,6 +162,35 @@ namespace
         throw std::runtime_error("Unable to determine executable path. Pass the guest ELF as argv[1] or define PS2X_DEFAULT_BOOT_ELF.");
 #endif
     }
+
+    // Parse command line. Flags may appear before/after the boot ELF path:
+    //   --cd <iso> | --cd=<iso>      configure the CD image for raw sector reads
+    // Any other token is treated as the boot ELF path (first one wins).
+    bool parseCommandLine(int argc, char *argv[], std::filesystem::path &bootPathOut, std::filesystem::path &cdImageOut)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string arg = argv[i] ? argv[i] : "";
+            if (arg == "--cd" || arg == "-cd")
+            {
+                if (i + 1 >= argc || !argv[i + 1] || argv[i + 1][0] == '\0')
+                {
+                    std::cerr << "[main] " << arg << " requires a path argument" << std::endl;
+                    return false;
+                }
+                cdImageOut = std::filesystem::path(argv[++i]);
+            }
+            else if (arg.rfind("--cd=", 0) == 0)
+            {
+                cdImageOut = std::filesystem::path(arg.substr(5));
+            }
+            else if (bootPathOut.empty())
+            {
+                bootPathOut = std::filesystem::path(arg);
+            }
+        }
+        return true;
+    }
 }
 
 int main(int argc, char *argv[])
@@ -173,7 +202,14 @@ int main(int argc, char *argv[])
 
     try
     {
-        std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        std::filesystem::path argvBootPath;
+        std::filesystem::path cdImagePath;
+        if (!parseCommandLine(argc, argv, argvBootPath, cdImagePath))
+        {
+            return 1;
+        }
+
+        std::filesystem::path pathObj = getExecutablePath(argvBootPath);
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
@@ -224,6 +260,22 @@ int main(int argc, char *argv[])
         {
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
             return 1;
+        }
+
+        if (!cdImagePath.empty())
+        {
+            PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
+            if (!ioPaths.cdImage.empty() && ioPaths.cdImage != cdImagePath)
+            {
+                std::cout << "[main] overriding cdImage " << ioPaths.cdImage.string()
+                          << " with " << cdImagePath.string() << std::endl;
+            }
+            else if (ioPaths.cdImage.empty())
+            {
+                std::cout << "[main] using CD image " << cdImagePath.string() << std::endl;
+            }
+            ioPaths.cdImage = cdImagePath;
+            PS2Runtime::setIoPaths(ioPaths);
         }
 
         runtime.run();

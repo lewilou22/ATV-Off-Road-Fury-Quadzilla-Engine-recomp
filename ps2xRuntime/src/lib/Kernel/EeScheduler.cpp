@@ -6,8 +6,17 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+
+extern uint32_t g_ps2Pc0ResumeRangeBegin;
+extern uint32_t g_ps2Pc0ResumeRangeEnd;
+extern uint32_t g_ps2Pc0ResumeTarget;
+extern uint32_t g_ps2IdleResumePc;
+extern uint32_t g_ps2IdleResumeA0;
+extern uint32_t g_ps2HoldEeTimeslices;
 
 namespace
 {
@@ -150,15 +159,184 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
                   std::chrono::steady_clock::now() + kVBlankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
+    m_lastNonZeroPc = 0u;
+}
+
+void EeScheduler::dumpIdleDiagnostics(const char *label)
+{
+    std::ostringstream os;
+    os << "[EeScheduler] " << label << "\n";
+    os << "  eeCycle=" << m_eeCycle << "  vsyncTick=" << m_vsyncTick
+       << "  deadlineCount=" << m_deadlines.size()
+       << "  pendingInvocations=" << m_pendingInvocations.size() << "\n";
+
+    const char *statusNames[] = {"Running", "Ready", "Waiting", "WaitingSuspended", "Suspended", "Dormant"};
+    const char *waitNames[] = {"None", "Sleep", "Semaphore", "EventFlag", "VSync", "External", "Mpeg"};
+
+    for (const auto &[id, t] : m_threads)
+    {
+        const char *st = (static_cast<int>(t.status) >= 0 && static_cast<int>(t.status) <= 5)
+                             ? statusNames[static_cast<int>(t.status)]
+                             : "???";
+        const char *wt = (static_cast<int>(t.wait.reason) >= 0 && static_cast<int>(t.wait.reason) <= 6)
+                             ? waitNames[static_cast<int>(t.wait.reason)]
+                             : "???";
+
+        uint32_t pc = t.context.pc;
+        uint32_t sp = getRegU32(&t.context, 29);
+        uint32_t ra = getRegU32(&t.context, 31);
+
+        os << "  Thread " << id
+           << ": status=" << st
+           << "  waitReason=" << wt
+           << "  priority=" << t.currentPriority << "/" << t.initialPriority
+           << "  suspend=" << t.suspendCount
+           << "  pc=0x" << std::hex << pc
+           << "  sp=0x" << sp
+           << "  ra=0x" << ra
+           << std::dec
+           << "  entry=0x" << std::hex << t.entry
+           << "  stack=0x" << t.stack
+           << std::dec
+           << "  invocations=" << t.invocations.size() << "\n";
+
+        if (t.wait.reason == EeWaitReason::Semaphore)
+        {
+            const auto &sw = std::get<EeSemaphoreWait>(t.wait.payload);
+            os << "    -> waiting on semaphore id=" << sw.id << "\n";
+            auto it = m_semaphores.find(sw.id);
+            if (it != m_semaphores.end())
+            {
+                os << "      sem count=" << it->second.count
+                   << " max=" << it->second.maxCount
+                   << " waiters=" << it->second.waiters.size() << "\n";
+            }
+        }
+        else if (t.wait.reason == EeWaitReason::EventFlag)
+        {
+            const auto &efw = std::get<EeEventFlagWait>(t.wait.payload);
+            os << "    -> waiting on eventFlag id=" << efw.id
+               << " bits=0x" << std::hex << efw.bits
+               << " mode=0x" << efw.mode << std::dec << "\n";
+            auto it = m_eventFlags.find(efw.id);
+            if (it != m_eventFlags.end())
+            {
+                os << "      evf bits=0x" << std::hex << it->second.bits
+                   << " initBits=0x" << it->second.initBits
+                   << std::dec
+                   << " waiters=" << it->second.waiters.size() << "\n";
+            }
+        }
+        else if (t.wait.reason == EeWaitReason::VSync)
+        {
+            const auto &vw = std::get<EeVSyncWait>(t.wait.payload);
+            os << "    -> waiting for VSync afterTick=" << vw.afterTick
+               << " (current vsyncTick=" << m_vsyncTick << ")\n";
+        }
+        else if (t.wait.reason == EeWaitReason::External || t.wait.reason == EeWaitReason::Mpeg)
+        {
+            const auto &ew = std::get<EeExternalWait>(t.wait.payload);
+            os << "    -> waiting external type=" << ew.type
+               << " token=" << ew.token << "\n";
+        }
+    }
+
+    os << "  Semaphores: " << m_semaphores.size()
+       << "  EventFlags: " << m_eventFlags.size()
+       << "  Alarms: " << m_alarms.size()
+       << "  IntcHandlers: " << m_intcHandlers.size()
+       << "  DmacHandlers: " << m_dmacHandlers.size() << "\n";
+
+    std::string diag = os.str();
+    std::cerr << diag;
+    ps2_log::append_runtime_log_text(diag);
 }
 
 void EeScheduler::run()
 {
     assertExecutor();
     m_running.store(true, std::memory_order_release);
+    m_lastDiagDumpTime = std::chrono::steady_clock::now();
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastDiagDumpTime).count();
+        if (elapsedMs >= kDiagDumpIntervalMs)
+        {
+            m_lastDiagDumpTime = now;
+            std::ostringstream os;
+            os << "[EeScheduler] PERIODIC STATUS (" << (elapsedMs / 1000.0) << "s elapsed)\n";
+            os << "  eeCycle=" << m_eeCycle << "  vsyncTick=" << m_vsyncTick
+               << "  threadCount=" << m_threads.size()
+               << "  semCount=" << m_semaphores.size()
+               << "  evfCount=" << m_eventFlags.size() << "\n";
+            const char *statusNames[] = {"Running", "Ready", "Waiting", "WaitingSuspended", "Suspended", "Dormant"};
+            const char *waitNames[] = {"None", "Sleep", "Semaphore", "EventFlag", "VSync", "External", "Mpeg"};
+            for (const auto &[id, t] : m_threads)
+            {
+                const char *st = (static_cast<int>(t.status) >= 0 && static_cast<int>(t.status) <= 5)
+                                     ? statusNames[static_cast<int>(t.status)]
+                                     : "???";
+                const char *wt = (static_cast<int>(t.wait.reason) >= 0 && static_cast<int>(t.wait.reason) <= 6)
+                                     ? waitNames[static_cast<int>(t.wait.reason)]
+                                     : "???";
+                uint32_t pc = t.context.pc;
+                uint32_t sp = getRegU32(&t.context, 29);
+                os << "  T" << id << ": " << st
+                   << " wait=" << wt
+                   << " pri=" << t.currentPriority
+                   << " sus=" << t.suspendCount
+                   << " pc=0x" << std::hex << pc
+                   << " sp=0x" << sp << std::dec
+                   << " inv=" << t.invocations.size() << "\n";
+
+                if (pc == 0x362FE0 || pc == 0x362FDC)
+                {
+                    uint32_t s0 = getRegU32(&t.context, 16);
+                    uint32_t s1 = getRegU32(&t.context, 17);
+                    uint32_t s2 = getRegU32(&t.context, 18);
+                    uint32_t s3 = getRegU32(&t.context, 19);
+                    uint32_t v0 = getRegU32(&t.context, 2);
+                    os << "    s0=0x" << std::hex << s0
+                       << " s1=0x" << s1
+                       << " s2=0x" << s2
+                       << " s3=0x" << s3
+                       << " v0=0x" << v0 << std::dec << "\n";
+                }
+            }
+            std::string diag = os.str();
+            std::cerr << diag;
+            ps2_log::append_runtime_log_text(diag);
+
+            if (m_rdram)
+            {
+                const auto dumpWords = [&](uint32_t phys, const char *label)
+                {
+                    std::ostringstream dw;
+                    dw << "[EeScheduler]   MEM " << label << " @" << std::hex << phys << ":";
+                    for (uint32_t i = 0; i < 4; ++i)
+                    {
+                        uint32_t word = 0;
+                        if (phys + i * 4 + 4 <= PS2_RAM_SIZE)
+                        {
+                            std::memcpy(&word, m_rdram + phys + i * 4, sizeof(word));
+                        }
+                        dw << " 0x" << word;
+                    }
+                    dw << std::dec << "\n";
+                    std::string dtext = dw.str();
+                    std::cerr << dtext;
+                    ps2_log::append_runtime_log_text(dtext);
+                };
+                dumpWords(0x411200u, "syscallRegTable");
+                dumpWords(0x0011F80u, "syscallMirror");
+                dumpWords(0x00002F0u, "probeBase");
+                dumpWords(0x00120E8u, "syscallWrCopy@5A");
+                dumpWords(0x001218Cu, "syscallWrFind@83");
+            }
+        }
+
         processPendingEvents();
         if (m_stopRequested.load(std::memory_order_acquire))
         {
@@ -170,6 +348,11 @@ void EeScheduler::run()
             GuestThread *next = selectReady();
             if (!next && m_pendingInvocations.empty())
             {
+                if (!m_idleDiagDumped)
+                {
+                    m_idleDiagDumped = true;
+                    dumpIdleDiagnostics("IDLE DIAGNOSTICS - no runnable threads");
+                }
                 publishSnapshot();
                 waitForEvent();
                 continue;
@@ -247,6 +430,35 @@ void EeScheduler::run()
                 }
                 continue;
             }
+
+            // pc=0 resume machinery (ATV1 pattern): if game override provides a
+            // flip-resume target and the last non-zero PC was in the expected range,
+            // resume there instead of going Dormant.
+            if (g_ps2Pc0ResumeTarget != 0u &&
+                m_lastNonZeroPc >= g_ps2Pc0ResumeRangeBegin &&
+                m_lastNonZeroPc < g_ps2Pc0ResumeRangeEnd &&
+                m_runtime.hasFunction(g_ps2Pc0ResumeTarget))
+            {
+                context.pc = g_ps2Pc0ResumeTarget;
+                std::cerr << "[EeScheduler] pc=0 resume -> flip-target 0x"
+                          << std::hex << g_ps2Pc0ResumeTarget << std::dec
+                          << " (last=0x" << m_lastNonZeroPc << ")" << std::endl;
+                continue;
+            }
+
+            // Idle-resume fallback for known game idle loops.
+            if (g_ps2IdleResumePc != 0u && m_runtime.hasFunction(g_ps2IdleResumePc))
+            {
+                context.pc = g_ps2IdleResumePc;
+                if (g_ps2IdleResumeA0 != 0u)
+                {
+                    SET_GPR_U32(&context, 4, g_ps2IdleResumeA0);
+                }
+                std::cerr << "[EeScheduler] pc=0 resume -> idle-target 0x"
+                          << std::hex << g_ps2IdleResumePc << std::dec << std::endl;
+                continue;
+            }
+
             makeDormant(*running);
             m_currentThreadId = 0;
             continue;
@@ -294,6 +506,10 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            if (context.pc != 0u)
+            {
+                m_lastNonZeroPc = context.pc;
+            }
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
@@ -1893,6 +2109,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
+        dispatchIrq(false, 9u); // VBlank INTC cause 9 (game's handler)
         break;
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);

@@ -460,6 +460,10 @@ else()
     )
 endif()
 
+target_sources(ps2EntryRunner PRIVATE
+    src/lib/scus_97211_overrides.cpp
+)
+
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     set_target_properties(ps2EntryRunner PROPERTIES
         UNITY_BUILD ON
@@ -496,7 +500,7 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
 endif()
 
 if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS)
+    target_compile_options(ps2EntryRunner PRIVATE /FS /bigobj)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

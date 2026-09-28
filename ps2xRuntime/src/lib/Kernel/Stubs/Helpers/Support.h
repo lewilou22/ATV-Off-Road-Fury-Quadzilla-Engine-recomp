@@ -1,6 +1,12 @@
 #include <algorithm>
 #include <cctype>
 
+namespace ps2_iso9660
+{
+    bool lookup(const std::string &ps2Path, uint32_t &lbn, uint32_t &sizeBytes);
+    bool materializeHostFile(const std::string &ps2Path, std::filesystem::path &hostPathOut);
+}
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -12,6 +18,7 @@ namespace
         uint32_t sizeBytes = 0;
         uint32_t baseLbn = 0;
         uint32_t sectors = 0;
+        bool fromIsoImage = false;
     };
 
     std::unordered_map<std::string, CdFileEntry> g_cdFilesByKey;
@@ -377,6 +384,22 @@ namespace
                     }
                     else
                     {
+                        uint32_t isoLbn = 0;
+                        uint32_t isoSize = 0;
+                        if (ps2_iso9660::lookup(ps2Path, isoLbn, isoSize))
+                        {
+                            CdFileEntry isoEntry;
+                            isoEntry.hostPath = getCdImagePath();
+                            isoEntry.sizeBytes = isoSize;
+                            isoEntry.baseLbn = isoLbn;
+                            isoEntry.sectors = sectorsForBytes(isoSize);
+                            isoEntry.fromIsoImage = true;
+                            g_cdFilesByKey.emplace(key, isoEntry);
+                            entryOut = isoEntry;
+                            g_lastCdError = 0;
+                            return true;
+                        }
+
                         g_lastCdError = -1;
                         return false;
                     }
@@ -441,6 +464,11 @@ namespace
     {
         for (const auto &[key, entry] : g_cdFilesByKey)
         {
+            if (entry.fromIsoImage)
+            {
+                continue;
+            }
+
             const uint32_t endLbn = entry.baseLbn + entry.sectors;
             if (lbn < entry.baseLbn || lbn >= endLbn)
             {

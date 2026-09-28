@@ -407,6 +407,24 @@ namespace ps2_syscalls
 
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Syscalls with authoritative NATIVE implementations (Dispatcher.cpp switch) must
+        // not be shadowed by guest overrides. The guest handler addresses registered via
+        // SetSyscall for these (e.g. kCopy@0x362e98, kFindAddress@0x362ed0) are mid-function
+        // re-entry points that are not entry labels in the generated runner functions, so
+        // hasFunction() cannot dispatch them (returns KE_ERROR = -1), which breaks kernel
+        // boot scans like InitSystemCallTableAddress (0x362f58) that rely on the kFindAddress
+        // result. Prefer the native implementation; the guest syscall table mirror is still
+        // written by setEeSyscallOverride so GetEntryAddress (0x5B) reads it consistently.
+        switch (syscallNumber)
+        {
+        case 0x5A: // Copy
+        case 0x5B: // GetEntryAddress
+        case 0x83: // FindAddress
+            return false;
+        default:
+            break;
+        }
+
         uint32_t handler = 0u;
         if (!runtime || !ctx ||
             !runtime->findEeSyscallOverride(syscallNumber, handler) ||
@@ -484,6 +502,9 @@ namespace ps2_syscalls
         const uint32_t handler = getRegU32(ctx, 5);
         runtime->setEeSyscallOverride(rdram, syscallIndex, handler);
 
+        RUNTIME_ERROR("SetSyscall(idx=0x" << std::hex << syscallIndex
+                      << " handler=0x" << handler << std::dec << ")\n");
+
         setReturnS32(ctx, 0);
     }
 
@@ -515,16 +536,22 @@ namespace ps2_syscalls
                 const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
                 if (requestedSize < PS2_RAM_SIZE)
                 {
-                    sp = PS2_RAM_SIZE - requestedSize;
+                    // The kernel allocates the automatic stack below the top of RDRAM,
+                    // but returns its high end as the initial (downward-growing) $sp.
+                    // Returning the low base here makes the first large local frame grow
+                    // directly into the heap whose EndOfHeap boundary is that same base.
+                    initialStack = PS2_RAM_SIZE - requestedSize;
+                    sp = PS2_RAM_SIZE - 0x10u;
                 }
                 else
                 {
-                    sp = PS2_RAM_SIZE;
+                    initialStack = 0u;
+                    sp = PS2_RAM_SIZE - 0x10u;
                 }
             }
             else
             {
-                sp = PS2_RAM_SIZE;
+                sp = PS2_RAM_SIZE - 0x10u;
             }
         }
         else if (stack != 0u)
@@ -542,7 +569,10 @@ namespace ps2_syscalls
         sp &= ~0xFu;
         if (stack == 0xFFFFFFFFu)
         {
-            initialStack = sp;
+            if (stackSize == 0u)
+            {
+                initialStack = sp;
+            }
         }
         else if (stack != 0u)
         {
@@ -562,7 +592,8 @@ namespace ps2_syscalls
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        // 0x01F80000 = real PS2 user-heap end (32MB RDRAM minus 512KB kernel-reserved top).
+        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F80000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
@@ -602,11 +633,20 @@ namespace ps2_syscalls
     {
         (void)rdram;
 
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        // Real PS2 user-heap end for 32MB RDRAM (kernel reserves the top 512KB).
+        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F80000u;
 
-        const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
-                                 : kDefaultGuestHeapEnd;
+        uint32_t ret = kDefaultGuestHeapEnd;
+        if (runtime)
+        {
+            const uint32_t heapLimit = runtime->guestHeapLimit();
+            const uint32_t heapBase = runtime->guestHeapBase();
+            // MSL/CodeWarrior CRTs call EndOfHeap before any SetupHeap (0x3D) has run:
+            // then guestHeapLimit() == guestHeapBase() (both the ELF-end suggestion) and the
+            // CRT's dlmalloc init would size a ~0-byte heap so every malloc fails. Fall back
+            // to the real kernel user-heap end in that state.
+            ret = (heapLimit > heapBase) ? heapLimit : kDefaultGuestHeapEnd;
+        }
 
         setReturnU32(ctx, ret);
     }
@@ -819,6 +859,11 @@ namespace ps2_syscalls
         const uint32_t target = getRegU32(ctx, 6);
         const uint32_t targetNorm = normalizeKernelAlias(target);
         const uint32_t callerPc = ctx->pc;
+
+        RUNTIME_ERROR("FindAddress(start=0x" << std::hex << originalStart
+                      << " end=0x" << originalEnd
+                      << " target=0x" << target << std::dec
+                      << " callerPc=0x" << std::hex << callerPc << std::dec << ")\n");
 
         uint32_t start = originalStart;
         uint32_t end = originalEnd;

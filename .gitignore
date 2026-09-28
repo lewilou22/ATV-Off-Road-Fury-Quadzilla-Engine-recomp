@@ -4,6 +4,8 @@
 out
 .vscode
 build
+build64/
+logs/
 
 *.exe
 *.ilk

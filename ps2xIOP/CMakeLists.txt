@@ -11,11 +11,14 @@ add_library(ps2_iop STATIC
     src/modules/dbcman.cpp
     src/modules/libsd.cpp
     src/modules/mcserv.cpp
+    src/modules/mtapman.cpp
+    src/modules/snd989.cpp
     src/modules/tsnddrv.cpp
     src/modules/cri_dtx.cpp
     src/modules/clfile.cpp
     src/modules/sound_update_stub.cpp
     src/modules/sdrdrv.cpp
+    src/modules/cdvdman.cpp
 )
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)

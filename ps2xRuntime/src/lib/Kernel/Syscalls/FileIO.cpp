@@ -1,6 +1,11 @@
 #include "Common.h"
 #include "FileIO.h"
 
+namespace ps2_iso9660
+{
+    bool materializeHostFile(const std::string &ps2Path, std::filesystem::path &hostPathOut);
+}
+
 namespace ps2_syscalls
 {
     static int allocatePs2Fd(FILE *file)
@@ -98,6 +103,16 @@ namespace ps2_syscalls
         RUNTIME_LOG("fioOpen: '" << hostPath << "' flags=0x" << std::hex << flags << std::dec << " mode='" << mode << "'");
 
         FILE *fp = ::fopen(hostPath.c_str(), mode);
+        const bool write = (flags & PS2_FIO_O_WRONLY) || (flags & PS2_FIO_O_RDWR);
+        if (!fp && !write)
+        {
+            std::filesystem::path cached;
+            if (ps2_iso9660::materializeHostFile(ps2Path, cached))
+            {
+                hostPath = cached.string();
+                fp = ::fopen(hostPath.c_str(), mode);
+            }
+        }
         if (!fp)
         {
             std::cerr << "fioOpen error: fopen failed for '" << hostPath << "': " << strerror(errno) << std::endl;

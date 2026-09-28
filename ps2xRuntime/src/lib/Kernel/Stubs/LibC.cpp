@@ -24,10 +24,10 @@ namespace ps2_stubs
             if (warnCount <= 16u)
             {
                 std::cerr << "[" << (op ? op : "memop") << "] size clamp from 0x"
-                          << std::hex << size << " to 0x" << kMaxTransfer
+                          << std::hex << size << " to 0x0 (rejected)"
                           << std::dec << std::endl;
             }
-            return kMaxTransfer;
+            return 0u;
         }
 
         uint32_t guestContiguousBytes(uint32_t guestAddr)

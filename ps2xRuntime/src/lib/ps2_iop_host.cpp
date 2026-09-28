@@ -14,6 +14,11 @@
 #include <limits>
 #include <utility>
 
+namespace ps2_iso9660
+{
+    bool materializeHostFile(const std::string &ps2Path, std::filesystem::path &hostPathOut);
+}
+
 #if !defined(_WIN32)
 #include <sys/types.h>
 #endif
@@ -293,12 +298,37 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
         return 0u;
     }
 
-    const std::filesystem::path hostPath{std::string(path)};
+    std::filesystem::path hostPath{std::string(path)};
 #if defined(_WIN32)
     std::FILE *stream = ::_wfopen(hostPath.c_str(), L"rb");
 #else
     std::FILE *stream = std::fopen(hostPath.string().c_str(), "rb");
 #endif
+    if (!stream)
+    {
+        std::error_code relEc;
+        std::filesystem::path relative;
+        const std::filesystem::path cdRoot = PS2Runtime::getIoPaths().cdRoot;
+        if (!cdRoot.empty())
+        {
+            relative = std::filesystem::relative(hostPath, cdRoot, relEc);
+        }
+        std::filesystem::path cached;
+        const std::string relativeGeneric = relative.generic_string();
+        const bool relativeOk = !relEc && !relativeGeneric.empty() &&
+                                relativeGeneric.find("..") == std::string::npos;
+        const std::string lookupPath = relativeOk ? relativeGeneric : hostPath.filename().string();
+        if (ps2_iso9660::materializeHostFile(lookupPath, cached) ||
+            (!relativeOk && ps2_iso9660::materializeHostFile(hostPath.filename().string(), cached)))
+        {
+            hostPath = cached;
+#if defined(_WIN32)
+            stream = ::_wfopen(hostPath.c_str(), L"rb");
+#else
+            stream = std::fopen(hostPath.string().c_str(), "rb");
+#endif
+        }
+    }
     if (!stream)
     {
         return 0u;

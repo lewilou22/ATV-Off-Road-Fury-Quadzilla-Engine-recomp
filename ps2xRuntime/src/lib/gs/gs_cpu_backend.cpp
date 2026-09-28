@@ -639,6 +639,19 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+
+    static std::atomic<uint32_t> s_drawLogCount{0};
+    if (s_drawLogCount.fetch_add(1) < 30)
+    {
+        std::cerr << "[GS:DRAW #" << s_drawLogCount.load() << "] type=" << (int)state.prim.type
+                  << " tme=" << (int)state.prim.tme << " abe=" << (int)state.prim.abe
+                  << " fbp=" << ctx.frame.fbp << " fbw=" << ctx.frame.fbw
+                  << " v0=(" << batch.vertices[0].x << "," << batch.vertices[0].y
+                  << " rgba=" << (int)batch.vertices[0].r << "," << (int)batch.vertices[0].g
+                  << "," << (int)batch.vertices[0].b << "," << (int)batch.vertices[0].a << ")"
+                  << (batch.vertexCount > 1 ? (" v1=(" + std::to_string(batch.vertices[1].x) + "," + std::to_string(batch.vertices[1].y) + ")") : "")
+                  << std::endl;
+    }
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -1787,6 +1800,35 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     decodeDisplaySize(request.display2, width2, height2);
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+    static uint32_t s_vramScanCounter = 0;
+    if ((++s_vramScanCounter % 60) == 1)
+    {
+        std::string nonZeroPages;
+        uint32_t totalNonZero = 0;
+        for (uint32_t p = 0; p < 512 && (p * 8192u) < m_vramSize; ++p)
+        {
+            uint32_t pageNonZero = 0;
+            const uint8_t *pageData = m_vram + p * 8192u;
+            for (uint32_t b = 0; b < 8192u; ++b)
+                if (pageData[b] != 0) ++pageNonZero;
+            if (pageNonZero > 0)
+            {
+                totalNonZero += pageNonZero;
+                nonZeroPages += " p" + std::to_string(p) + ":" + std::to_string(pageNonZero);
+            }
+        }
+        std::cerr << "[GS:VRAM] totalNonZero=" << totalNonZero << " pages:" << nonZeroPages << std::endl;
+        for (uint32_t testPage : {0u, 70u, 140u, 280u, 420u})
+        {
+            if (testPage * 8192u < m_vramSize)
+            {
+                const uint32_t *words = reinterpret_cast<const uint32_t*>(m_vram + testPage * 8192u);
+                std::cerr << "[VRAM:SAMPLE] p" << testPage << ": 0x"
+                          << std::hex << words[0] << " 0x" << words[1] << " 0x" << words[2] << " 0x" << words[3] << std::dec << std::endl;
+            }
+        }
+    }
+
     if (!valid1 && !valid2)
         return result;
 
@@ -1813,10 +1855,12 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
             return false;
 
-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+        if (!usedPreferred && countNonBlackPixels(pixels, width, height) == 0u)
         {
             for (const GSFrameReg &candidate : request.contextFrames)
             {
+                if (candidate.fbw == 0u)
+                    continue;
                 if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
                     continue;
                 std::vector<uint8_t> candidatePixels;
@@ -1824,9 +1868,30 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                     continue;
                 if (countNonBlackPixels(candidatePixels, width, height) == 0u)
                     continue;
+                std::cerr << "[GS:FALLBACK] Found candidate context frame FBP=" << candidate.fbp << std::endl;
                 selected = candidate;
                 pixels.swap(candidatePixels);
                 break;
+            }
+
+            if (countNonBlackPixels(pixels, width, height) == 0u)
+            {
+                const uint32_t fallbackFbps[] = {280u, 70u, 0u, 140u};
+                for (uint32_t fbp : fallbackFbps)
+                {
+                    if (fbp == selected.fbp)
+                        continue;
+                    GSFrameReg candidate{fbp, displayFrame.fbw ? displayFrame.fbw : 10u, displayFrame.psm, 0u};
+                    std::vector<uint8_t> candidatePixels;
+                    if (!CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u))
+                        continue;
+                    if (countNonBlackPixels(candidatePixels, width, height) == 0u)
+                        continue;
+                    std::cerr << "[GS:FALLBACK] Found candidate fallback FBP=" << candidate.fbp << std::endl;
+                    selected = candidate;
+                    pixels.swap(candidatePixels);
+                    break;
+                }
             }
         }
         return true;
@@ -1837,38 +1902,55 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         GSFrameReg selected1{}, selected2{};
         std::vector<uint8_t> crt1, crt2;
         bool preferred1 = false, preferred2 = false;
-        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
-            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
+        if (copySource(displayFrame1, origin1, width1, height1, true, true, selected1, crt1, preferred1) &&
+            copySource(displayFrame2, origin2, width2, height2, true, true, selected2, crt2, preferred2))
         {
             result.width = std::max(width1, width2);
             result.height = std::max(height1, height2);
             result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
-            const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
-            const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
-            const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
-            for (uint32_t y = 0; y < result.height; ++y)
-                for (uint32_t x = 0; x < result.width; ++x)
-                {
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
-                    dst[0] = bgR;
-                    dst[1] = bgG;
-                    dst[2] = bgB;
-                    dst[3] = pmode.alp;
-                }
-            if (!pmode.slbg)
+
+            const uint32_t nonBlack1 = countNonBlackPixels(crt1, width1, height1);
+            const uint32_t nonBlack2 = countNonBlackPixels(crt2, width2, height2);
+
+            if (nonBlack1 == 0u && nonBlack2 > 0u)
+            {
                 for (uint32_t y = 0; y < height2; ++y)
                     std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
-            for (uint32_t y = 0; y < height1; ++y)
-                for (uint32_t x = 0; x < width1; ++x)
-                {
-                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
-                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
-                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
-                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
-                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
-                    dst[3] = pmode.amod ? dst[3] : src[3];
-                }
+            }
+            else if (nonBlack2 == 0u && nonBlack1 > 0u)
+            {
+                for (uint32_t y = 0; y < height1; ++y)
+                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt1.data() + y * kHostFrameWidth * 4u, width1 * 4u);
+            }
+            else
+            {
+                const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
+                const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
+                const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
+                for (uint32_t y = 0; y < result.height; ++y)
+                    for (uint32_t x = 0; x < result.width; ++x)
+                    {
+                        uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
+                        dst[0] = bgR;
+                        dst[1] = bgG;
+                        dst[2] = bgB;
+                        dst[3] = pmode.alp;
+                    }
+                if (!pmode.slbg)
+                    for (uint32_t y = 0; y < height2; ++y)
+                        std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
+                for (uint32_t y = 0; y < height1; ++y)
+                    for (uint32_t x = 0; x < width1; ++x)
+                    {
+                        const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
+                        uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
+                        const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
+                        dst[0] = blendPresentationChannel(src[0], dst[0], factor);
+                        dst[1] = blendPresentationChannel(src[1], dst[1], factor);
+                        dst[2] = blendPresentationChannel(src[2], dst[2], factor);
+                        dst[3] = pmode.amod ? dst[3] : src[3];
+                    }
+            }
             normalizePresentationAlpha(result.pixels, result.width, result.height);
             if (fieldMode)
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);

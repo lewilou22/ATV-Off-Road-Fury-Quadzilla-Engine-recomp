@@ -3,6 +3,377 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#include <mutex>
+
+namespace ps2_iso9660
+{
+    namespace
+    {
+        constexpr uint32_t kIsoSectorSize = 2048u;
+
+        uint32_t readU32LE(const uint8_t *bytes)
+        {
+            return static_cast<uint32_t>(bytes[0]) |
+                   (static_cast<uint32_t>(bytes[1]) << 8) |
+                   (static_cast<uint32_t>(bytes[2]) << 16) |
+                   (static_cast<uint32_t>(bytes[3]) << 24);
+        }
+
+        bool readIsoSector(uint32_t lbn, uint8_t *dst)
+        {
+            const std::filesystem::path image = getCdImagePath();
+            if (image.empty() || !dst)
+            {
+                return false;
+            }
+            return readHostRange(image, static_cast<uint64_t>(lbn) * kIsoSectorSize, dst, kIsoSectorSize);
+        }
+
+        std::string isoRecordName(const uint8_t *rec, bool joliet)
+        {
+            const uint8_t nameLen = rec[32];
+            if (nameLen == 0)
+            {
+                return {};
+            }
+            if (nameLen == 1 && rec[33] == 0)
+            {
+                return ".";
+            }
+            if (nameLen == 1 && rec[33] == 1)
+            {
+                return "..";
+            }
+
+            std::string name;
+            if (joliet)
+            {
+                name.reserve(nameLen / 2);
+                for (uint8_t i = 0; i + 1 < nameLen; i += 2)
+                {
+                    const uint16_t ch = static_cast<uint16_t>((rec[33 + i] << 8) | rec[33 + i + 1]);
+                    if (ch == 0)
+                    {
+                        break;
+                    }
+                    name.push_back(ch < 128 ? static_cast<char>(ch) : '?');
+                }
+            }
+            else
+            {
+                name.assign(reinterpret_cast<const char *>(rec + 33), nameLen);
+            }
+            return stripIsoVersionSuffix(std::move(name));
+        }
+
+        std::vector<std::string> splitCdPath(const std::string &ps2Path)
+        {
+            const std::string normalized = normalizeCdPathNoPrefix(ps2Path);
+            std::vector<std::string> parts;
+            std::string current;
+            for (char ch : normalized)
+            {
+                if (ch == '/' || ch == '\\')
+                {
+                    if (!current.empty())
+                    {
+                        parts.push_back(current);
+                        current.clear();
+                    }
+                }
+                else
+                {
+                    current.push_back(ch);
+                }
+            }
+            if (!current.empty())
+            {
+                parts.push_back(current);
+            }
+            return parts;
+        }
+
+        bool namesEqual(const std::string &lhs, const std::string &rhs)
+        {
+            return toLowerAscii(stripIsoVersionSuffix(lhs)) == toLowerAscii(stripIsoVersionSuffix(rhs));
+        }
+
+        bool walkDirectory(uint32_t dirLbn,
+                           uint32_t dirSize,
+                           const std::string &wantName,
+                           bool wantDir,
+                           bool joliet,
+                           uint32_t &outLbn,
+                           uint32_t &outSize)
+        {
+            std::vector<uint8_t> sector(kIsoSectorSize);
+            uint32_t remaining = dirSize;
+            uint32_t lbn = dirLbn;
+            while (remaining > 0)
+            {
+                if (!readIsoSector(lbn, sector.data()))
+                {
+                    return false;
+                }
+
+                const uint32_t used = std::min<uint32_t>(kIsoSectorSize, remaining);
+                uint32_t offset = 0;
+                while (offset < used)
+                {
+                    const uint8_t recLen = sector[offset];
+                    if (recLen == 0)
+                    {
+                        break;
+                    }
+                    if (offset + recLen > kIsoSectorSize)
+                    {
+                        break;
+                    }
+
+                    const uint8_t *rec = sector.data() + offset;
+                    const std::string name = isoRecordName(rec, joliet);
+                    if (!name.empty() && name != "." && name != "..")
+                    {
+                        const bool isDir = (rec[25] & 0x02u) != 0u;
+                        if (isDir == wantDir && namesEqual(name, wantName))
+                        {
+                            outLbn = readU32LE(rec + 2);
+                            outSize = readU32LE(rec + 10);
+                            return true;
+                        }
+                    }
+                    offset += recLen;
+                }
+
+                remaining -= used;
+                ++lbn;
+            }
+            return false;
+        }
+
+        bool lookupVolume(bool joliet, const std::vector<std::string> &parts, uint32_t &lbn, uint32_t &sizeBytes)
+        {
+            std::vector<uint8_t> sector(kIsoSectorSize);
+            uint32_t dirLbn = 0;
+            uint32_t dirSize = 0;
+            bool foundVolume = false;
+
+            for (uint32_t volumeLbn = 16; volumeLbn < 32; ++volumeLbn)
+            {
+                if (!readIsoSector(volumeLbn, sector.data()))
+                {
+                    return false;
+                }
+                const uint8_t type = sector[0];
+                if (type == 255)
+                {
+                    break;
+                }
+                if (std::memcmp(sector.data() + 1, "CD001", 5) != 0)
+                {
+                    continue;
+                }
+                if (!joliet && type == 1)
+                {
+                    dirLbn = readU32LE(sector.data() + 156 + 2);
+                    dirSize = readU32LE(sector.data() + 156 + 10);
+                    foundVolume = true;
+                    break;
+                }
+                if (joliet && type == 2)
+                {
+                    dirLbn = readU32LE(sector.data() + 156 + 2);
+                    dirSize = readU32LE(sector.data() + 156 + 10);
+                    foundVolume = true;
+                    break;
+                }
+            }
+
+            if (!foundVolume || parts.empty())
+            {
+                return false;
+            }
+
+            for (size_t i = 0; i < parts.size(); ++i)
+            {
+                const bool wantDir = (i + 1) < parts.size();
+                uint32_t foundLbn = 0;
+                uint32_t foundSize = 0;
+                if (!walkDirectory(dirLbn, dirSize, parts[i], wantDir, joliet, foundLbn, foundSize))
+                {
+                    return false;
+                }
+                if (wantDir)
+                {
+                    dirLbn = foundLbn;
+                    dirSize = foundSize;
+                }
+                else
+                {
+                    lbn = foundLbn;
+                    sizeBytes = foundSize;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::filesystem::path cacheRelativePath(const std::string &ps2Path)
+        {
+            std::string normalized = normalizeCdPathNoPrefix(ps2Path);
+            for (char &ch : normalized)
+            {
+                if (ch == '\\')
+                {
+                    ch = '/';
+                }
+                else if (ch == ':' || ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|')
+                {
+                    ch = '_';
+                }
+            }
+            return std::filesystem::path(normalized);
+        }
+    }
+
+    bool lookup(const std::string &ps2Path, uint32_t &lbn, uint32_t &sizeBytes)
+    {
+        static std::mutex mutex;
+        static std::filesystem::path cachedImage;
+        static std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> hits;
+        static std::unordered_set<std::string> misses;
+
+        const std::filesystem::path image = getCdImagePath();
+        if (image.empty())
+        {
+            return false;
+        }
+
+        const std::string key = toLowerAscii(normalizeCdPathNoPrefix(ps2Path));
+        if (key.empty())
+        {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (cachedImage != image)
+        {
+            hits.clear();
+            misses.clear();
+            cachedImage = image;
+        }
+
+        auto hit = hits.find(key);
+        if (hit != hits.end())
+        {
+            lbn = hit->second.first;
+            sizeBytes = hit->second.second;
+            return true;
+        }
+        if (misses.count(key) != 0)
+        {
+            return false;
+        }
+
+        const std::vector<std::string> parts = splitCdPath(ps2Path);
+        bool found = lookupVolume(false, parts, lbn, sizeBytes);
+        if (!found)
+        {
+            found = lookupVolume(true, parts, lbn, sizeBytes);
+        }
+
+        static uint32_t logCount = 0;
+        if (found)
+        {
+            hits.emplace(key, std::make_pair(lbn, sizeBytes));
+            if (logCount < 32u)
+            {
+                std::cerr << "[iso9660] " << ps2Path
+                          << " -> lbn=0x" << std::hex << lbn
+                          << " size=0x" << sizeBytes << std::dec << std::endl;
+                ++logCount;
+            }
+            return true;
+        }
+
+        misses.insert(key);
+        if (logCount < 32u)
+        {
+            std::cerr << "[iso9660] miss: " << ps2Path << std::endl;
+            ++logCount;
+        }
+        return false;
+    }
+
+    bool materializeHostFile(const std::string &ps2Path, std::filesystem::path &hostPathOut)
+    {
+        uint32_t lbn = 0;
+        uint32_t sizeBytes = 0;
+        if (!lookup(ps2Path, lbn, sizeBytes))
+        {
+            return false;
+        }
+
+        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        std::filesystem::path cacheRoot = paths.elfDirectory.empty()
+                                              ? std::filesystem::path(".cdcache")
+                                              : (paths.elfDirectory / ".cdcache");
+        const std::filesystem::path relative = cacheRelativePath(ps2Path);
+        if (relative.empty())
+        {
+            return false;
+        }
+
+        std::filesystem::path cachePath = cacheRoot / relative;
+        std::error_code ec;
+        std::filesystem::create_directories(cachePath.parent_path(), ec);
+        if (std::filesystem::is_regular_file(cachePath, ec) && !ec)
+        {
+            const uint64_t existing = std::filesystem::file_size(cachePath, ec);
+            if (!ec && existing == static_cast<uint64_t>(sizeBytes))
+            {
+                hostPathOut = cachePath;
+                return true;
+            }
+        }
+
+        std::ofstream out(cachePath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open())
+        {
+            return false;
+        }
+
+        uint64_t remaining = sizeBytes;
+        uint64_t offset = static_cast<uint64_t>(lbn) * kIsoSectorSize;
+        std::vector<uint8_t> chunk(static_cast<size_t>(std::min<uint64_t>(remaining == 0 ? 0 : remaining, 1024u * 1024u)));
+        while (remaining > 0)
+        {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(remaining, chunk.size()));
+            if (!readHostRange(getCdImagePath(), offset, chunk.data(), n))
+            {
+                return false;
+            }
+            out.write(reinterpret_cast<const char *>(chunk.data()), static_cast<std::streamsize>(n));
+            if (!out.good())
+            {
+                return false;
+            }
+            offset += n;
+            remaining -= n;
+        }
+
+        hostPathOut = cachePath;
+        out.close();
+        static uint32_t extractLogs = 0;
+        if (extractLogs < 16u)
+        {
+            std::cerr << "[iso9660] extracted " << ps2Path << " -> " << cachePath.string() << std::endl;
+            ++extractLogs;
+        }
+        return true;
+    }
+}
+
 namespace ps2_stubs
 {
     namespace
@@ -315,6 +686,16 @@ namespace ps2_stubs
 
         if (ok)
         {
+            static uint32_t s_cdReadLogCount = 0;
+            if (++s_cdReadLogCount <= 50 || (s_cdReadLogCount % 200) == 0)
+            {
+                std::cerr << "[CD Read] lbn=0x" << std::hex << selected.lbn << std::dec
+                          << " sectors=" << selected.sectors
+                          << " dst=0x" << std::hex << selected.buf
+                          << " pc=0x" << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31) << std::dec
+                          << " count=" << s_cdReadLogCount << std::endl;
+            }
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;
